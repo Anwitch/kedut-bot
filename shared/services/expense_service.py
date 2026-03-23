@@ -18,6 +18,10 @@ def _get_category_cache() -> dict[str, str]:
     db = get_supabase()
     res = db.table("categories").select("id, name").execute()
     _category_cache = {row["name"]: row["id"] for row in (res.data or [])}
+    
+    if not _category_cache:
+        raise RuntimeError("Categories table is empty. Please seed the database first.")
+        
     return _category_cache
 
 

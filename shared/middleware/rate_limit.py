@@ -4,7 +4,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from shared.database.supabase_client import get_supabase
 
-MAX_REQUESTS = 10       # max request per window
+MAX_REQUESTS = 5       # max request per window
 WINDOW_MINUTES = 1      # per berapa menit
 
 def rate_limited(func):
