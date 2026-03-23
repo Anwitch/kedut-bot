@@ -111,15 +111,40 @@ bot/
 Bot ini butuh tabel berikut di Supabase:
 
 ```sql
+create table categories (
+  id          serial primary key,
+  name        varchar not null unique,
+  icon        varchar default '💰',
+  created_at  timestamptz default now()
+);
+
 -- Pengeluaran per user
 create table expenses (
   id          uuid primary key default gen_random_uuid(),
   user_id     text not null,
   amount      numeric not null,
-  category    text,
+  category_id int references categories(id),
   note        text,
   expense_date date,
-  created_at  timestamptz default now()
+  created_at  timestamptz default now(),
+  updated_at  timestamptz default now()
+);
+
+-- Registrasi user (whitelist)
+create table users (
+  user_id       text primary key,
+  username      text,
+  first_name    text,
+  registered_at timestamptz default now(),
+  is_active     boolean default true
+);
+
+-- Rate limiting
+create table rate_limits (
+  user_id     text not null,
+  window_start timestamptz not null,
+  request_count int default 1,
+  primary key (user_id, window_start)
 );
 ```
 
