@@ -8,6 +8,8 @@ from shared.nlp.gemini_parser import (
 )
 from shared.services.expense_service import add_expense, delete_expense
 from shared.utils.formatters import format_currency, format_expense_confirmation
+from shared.middleware.auth import require_registered
+from shared.middleware.rate_limit import rate_limited
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,8 @@ def _quota_error_message(e: GeminiQuotaExceeded) -> str:
         + "\n\nSementara itu, kamu bisa catat dulu di Notes terus masukin nanti."
     )
 
+@require_registered
+@rate_limited
 async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     text = update.message.text.strip()
@@ -82,6 +86,8 @@ async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+@require_registered
+@rate_limited
 async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     message = update.message

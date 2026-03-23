@@ -4,6 +4,8 @@ from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
+from shared.services.user_service import register_user
+
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📝 Catat Pengeluaran"],
@@ -17,6 +19,14 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    
+    # Auto-register saat /start
+    register_user(
+        user_id=str(user.id),
+        username=user.username or "",
+        first_name=user.first_name or "",
+    )
+
     await update.message.reply_text(
         f"👋 Halo *{user.first_name}*!\n\n"
         "Aku *Montrac* — bot pencatat pengeluaranmu. 🤖💰\n\n"
