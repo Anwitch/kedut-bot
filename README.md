@@ -1,0 +1,144 @@
+# 🤖 Montrac Bot
+
+> **Bot Telegram untuk mencatat pengeluaran harian secara natural — cukup ketik atau foto struk, sisanya diurus AI.**
+
+Montrac Bot adalah bagian dari proyek [Montrac](https://github.com/andriewijaya) — money tracker yang dibangun live di depan kamera sebagai bagian dari seri konten *build in public*. Bot ini open source sebagai bentuk transparansi dan buat kalian yang pengen belajar atau fork buat project sendiri.
+
+---
+
+## ✨ Fitur
+
+| Fitur | Cara pakai |
+|---|---|
+| 💬 Catat via teks natural | `"makan siang 35rb"`, `"bensin 80ribu"` |
+| 🧾 Scan struk via foto | Kirim foto struk → otomatis terbaca |
+| ↩️ Batalkan transaksi | Tombol **Batalkan** muncul setelah catat |
+| 📊 Ringkasan mingguan | Ketuk menu **Ringkasan Minggu Ini** |
+| 📅 Ringkasan bulanan | Ketuk menu **Ringkasan Bulan Ini** |
+
+---
+
+## 🧱 Tech Stack
+
+- **Python 3.11+**
+- **[python-telegram-bot](https://python-telegram-bot.org/) v21** — Telegram Bot API wrapper
+- **[Gemini API](https://aistudio.google.com/)** — NLP parsing teks & OCR struk
+- **[Supabase](https://supabase.com/)** — Database & auth
+- **python-dotenv** — Environment variable management
+
+---
+
+## 🚀 Cara Setup
+
+### 1. Clone repo
+
+```bash
+git clone https://github.com/andriewijaya/montrac-bot.git
+cd montrac-bot
+```
+
+### 2. Buat virtual environment
+
+```bash
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Setup environment variables
+
+```bash
+cp .env.example .env
+```
+
+Lalu isi `.env` dengan credentials kamu:
+
+```env
+TELEGRAM_BOT_TOKEN=   # dari @BotFather
+SUPABASE_URL=         # dari Supabase Dashboard → Project Settings → API
+SUPABASE_ANON_KEY=    # dari Supabase Dashboard → Project Settings → API
+GEMINI_API_KEY=       # dari https://aistudio.google.com/app/apikey
+```
+
+### 5. Jalankan bot
+
+```bash
+python main.py
+```
+
+---
+
+## 📁 Struktur Folder
+
+```
+bot/
+├── main.py                      # Entry point
+├── requirements.txt
+├── .env.example
+│
+├── handlers/                    # Telegram message handlers
+│   ├── expense_handler.py       # Handle input teks & foto struk
+│   ├── start_handler.py         # /start, /help, keyboard menu
+│   └── summary_handler.py       # Ringkasan mingguan & bulanan
+│
+└── shared/                      # Logic inti (reusable)
+    ├── config.py                # Load & validasi env vars
+    ├── database/
+    │   └── supabase_client.py   # Singleton Supabase client
+    ├── nlp/
+    │   └── gemini_parser.py     # Parsing teks & OCR via Gemini
+    ├── services/
+    │   ├── expense_service.py   # CRUD pengeluaran
+    │   └── summary_service.py   # Agregasi ringkasan
+    └── utils/
+        └── formatters.py        # Format currency, pesan konfirmasi
+```
+
+---
+
+## 🗄️ Setup Supabase
+
+Bot ini butuh tabel berikut di Supabase:
+
+```sql
+-- Pengeluaran per user
+create table expenses (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     text not null,
+  amount      numeric not null,
+  category    text,
+  note        text,
+  expense_date date,
+  created_at  timestamptz default now()
+);
+```
+
+> Pastikan RLS (Row Level Security) di-setup sesuai kebutuhan deployment kamu.
+
+---
+
+## 🤝 Kontribusi
+
+Bot ini open source dan ide fiturnya sering datang dari komunitas. Kalau kamu punya ide atau nemu bug, buka aja [issue](../../issues) atau langsung PR.
+
+---
+
+## 📺 Build in Public
+
+Proses pembuatan bot ini direkam dan diupload sebagai seri konten. Follow [@andriewijaya._](https://www.instagram.com/andriewijaya._) dan [@andrienih](https://www.tiktok.com/@andrienih) buat ngikutin perjalanannya.
+
+---
+
+## 📄 License
+
+MIT — bebas dipakai, dimodifikasi, dan didistribusikan.

@@ -1,0 +1,30 @@
+# Credentials — NEVER bake into image
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Logs & temp
+*.log
+logs/
+*.tmp
+*.bak
+
+# Docs (tidak perlu di image)
+README.md
