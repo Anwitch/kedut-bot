@@ -64,10 +64,11 @@ Kembalikan HANYA JSON (tanpa teks tambahan) dengan format:
 }
 
 Aturan:
-- Ekstrak SETIAP baris item di struk, bukan hanya totalnya.
+- Ekstrak SETIAP baris item produk/layanan di struk.
 - Jika harga item tidak jelas / tidak terbaca, tetap masukkan item dengan amount=0.
-- JANGAN sertakan baris subtotal, pajak, diskon, atau grand total sebagai item.
-- Kategorikan setiap item secara individual sesuai konteksnya.
+- JANGAN sertakan baris subtotal, diskon, atau grand total sebagai item.
+- Pajak (PPN, tax, service charge) WAJIB dimasukkan sebagai item TERPISAH dengan category="Tagihan" dan name sesuai label di struk (misal "PPN 11%", "Service Charge").
+- Kategorikan setiap item produk secara individual sesuai konteksnya.
 - Jika tanggal tidak jelas, set null.
 - Angka Indonesia: 35.000 = 35000; 1.500.000 = 1500000.
 """
