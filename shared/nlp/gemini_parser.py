@@ -49,21 +49,26 @@ Aturan angka: 35rb=35000, 1.5jt=1500000, 1jt=1000000"""
 
 RECEIPT_SYSTEM_PROMPT = """Kamu adalah asisten keuangan. Kamu menerima FOTO STRUK/RECEIPT.
 
-Tugasmu: lakukan OCR dan ekstrak 1 transaksi pengeluaran utama dari struk.
+Tugasmu: lakukan OCR dan ekstrak SETIAP ITEM dari struk sebagai daftar pengeluaran terpisah.
 
 Kembalikan HANYA JSON (tanpa teks tambahan) dengan format:
 {
-    "amount": <angka float>,
-    "category": "<salah satu: Makan, Transport, Belanja, Kesehatan, Hiburan, Tagihan, Pendidikan, Olahraga, Rumah, Lainnya>",
-    "note": "<deskripsi singkat, idealnya nama merchant + konteks>",
+    "items": [
+        {
+            "name": "<nama item>",
+            "amount": <harga item sebagai float>,
+            "category": "<salah satu: Makan, Transport, Belanja, Kesehatan, Hiburan, Tagihan, Pendidikan, Olahraga, Rumah, Lainnya>"
+        }
+    ],
     "date": "<YYYY-MM-DD atau null>"
 }
 
 Aturan:
-- "amount" harus TOTAL BAYAR/GRAND TOTAL (bukan subtotal, bukan kembalian).
-- Jika ada lebih dari satu kandidat total, pilih yang paling mewakili jumlah dibayar.
+- Ekstrak SETIAP baris item di struk, bukan hanya totalnya.
+- Jika harga item tidak jelas / tidak terbaca, tetap masukkan item dengan amount=0.
+- JANGAN sertakan baris subtotal, pajak, diskon, atau grand total sebagai item.
+- Kategorikan setiap item secara individual sesuai konteksnya.
 - Jika tanggal tidak jelas, set null.
-- Jika tidak bisa menemukan total dengan yakin, set amount=0.
 - Angka Indonesia: 35.000 = 35000; 1.500.000 = 1500000.
 """
 
@@ -437,10 +442,12 @@ def parse_expense_from_receipt_image(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
     caption: str | None = None,
-) -> dict | None:
-    """Parse an expense from a receipt image using Gemini vision/OCR.
+) -> list[dict] | None:
+    """Parse per-item expenses from a receipt image using Gemini vision/OCR.
 
-    Returns a dict with amount, category, note, date (date object) or None.
+    Returns a list of dicts [{name, amount, category, date}], or None on failure.
+    Items with unclear amounts (amount=0) are included with '?' appended to name
+    so the user can edit them.
     """
     if not image_bytes:
         return None
@@ -461,14 +468,12 @@ def parse_expense_from_receipt_image(
         )
 
         logger.info(
-            "Gemini receipt OCR model=%s bytes=%s caption=%s",
+            "Gemini receipt OCR (per-item) model=%s bytes=%s caption=%s",
             _MODEL_NAME,
             len(image_bytes),
             bool(hint),
         )
 
-        # Let the legacy SDK handle the image object directly.
-        # For text-in-image OCR, place the prompt after the image.
         img = Image.open(BytesIO(image_bytes))
         response = _model.generate_content([img, prompt])
         raw = (response.text or "").strip()
@@ -477,24 +482,44 @@ def parse_expense_from_receipt_image(
         raw_json = _extract_json(raw)
         data = json.loads(raw_json)
 
-        expense_date: date | None = None
-        if data.get("date") and str(data["date"]).lower() not in ("null", "none", ""):
+        # Parse receipt date
+        expense_date: date
+        raw_date = data.get("date")
+        if raw_date and str(raw_date).lower() not in ("null", "none", ""):
             try:
-                expense_date = date.fromisoformat(str(data["date"]))
+                expense_date = date.fromisoformat(str(raw_date))
             except ValueError:
-                expense_date = None
+                expense_date = date.today()
+        else:
+            expense_date = _parse_relative_date(hint) if hint else date.today()
 
-        parsed = {
-            "amount": _coerce_amount(data.get("amount", 0)),
-            "category": str(data.get("category", "Lainnya")),
-            "note": str(data.get("note", "")) or "Pengeluaran",
-            "date": expense_date or (_parse_relative_date(hint) if hint else date.today()),
-        }
-
-        if parsed["amount"] <= 0:
+        # Parse items list
+        raw_items = data.get("items", [])
+        if not isinstance(raw_items, list) or not raw_items:
+            logger.warning("Gemini receipt returned no items.")
             return None
 
-        return parsed
+        results: list[dict] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            amount = _coerce_amount(item.get("amount", 0))
+            name = str(item.get("name", "")).strip() or "Item"
+            category = str(item.get("category", "Lainnya"))
+
+            # Flag ambiguous items with '?' so user knows to review
+            if amount <= 0:
+                name = f"{name} (?)"
+                amount = 0.0
+
+            results.append({
+                "note": name,
+                "amount": amount,
+                "category": category,
+                "date": expense_date,
+            })
+
+        return results if results else None
 
     except Exception as e:
         if _is_quota_error(e):

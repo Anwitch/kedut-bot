@@ -104,7 +104,7 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         photo = message.photo[-1]  # highest resolution
         tg_file = await context.bot.get_file(photo.file_id)
         data = await tg_file.download_as_bytearray()
-        parsed = parse_expense_from_receipt_image(
+        items = parse_expense_from_receipt_image(
             bytes(data), mime_type="image/jpeg", caption=caption
         )
     except GeminiQuotaExceeded as e:
@@ -112,9 +112,9 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     except Exception as e:
         logger.error("Error downloading/parsing receipt photo: %s", e, exc_info=True)
-        parsed = None
+        items = None
 
-    if not parsed or parsed.get("amount", 0) <= 0:
+    if not items:
         await message.reply_text(
             "❓ Maaf, aku belum bisa membaca struk itu.\n\n"
             "Coba kirim foto yang lebih jelas (tidak blur, rata, terang), atau ketik manual seperti:\n"
@@ -123,25 +123,54 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    try:
-        row = add_expense(
-            user_id=user_id,
-            amount=parsed["amount"],
-            category_name=parsed["category"],
-            note=parsed["note"],
-            expense_date=parsed["date"],
-        )
-        expense_id = row.get("id")
+    # Save each item and collect results
+    saved: list[tuple[dict, str | None]] = []  # (item, expense_id)
+    failed = 0
+    for item in items:
+        try:
+            # Skip items with ambiguous (zero) amounts — flagged with (?)
+            if item["amount"] <= 0:
+                saved.append((item, None))
+                continue
+            row = add_expense(
+                user_id=user_id,
+                amount=item["amount"],
+                category_name=item["category"],
+                note=item["note"],
+                expense_date=item["date"],
+            )
+            saved.append((item, row.get("id")))
+        except Exception as e:
+            logger.error("Error saving receipt item '%s': %s", item.get("note"), e, exc_info=True)
+            failed += 1
+
+    if not saved and failed > 0:
+        await message.reply_text("⚠️ Gagal menyimpan semua item. Coba lagi ya!")
+        return
+
+    # Summary header
+    valid_items = [(item, eid) for item, eid in saved if item["amount"] > 0]
+    grand_total = sum(item["amount"] for item, _ in valid_items)
+    ambiguous_count = sum(1 for item, _ in saved if item["amount"] <= 0)
+
+    header_lines = [f"📷 *Struk berhasil dibaca!* ({len(saved)} item)\n"]
+    if ambiguous_count:
+        header_lines.append(f"⚠️ _{ambiguous_count} item harga tidak terbaca (tandai ?)_\n")
+    header_lines.append(f"💰 *Total: Rp {grand_total:,.0f}*")
+    await message.reply_text("\n".join(header_lines), parse_mode="Markdown")
+
+    # One message per item with individual undo button
+    for item, expense_id in saved:
         msg = format_expense_confirmation(
-            amount=parsed["amount"],
-            category=parsed["category"],
-            note=parsed["note"],
+            amount=item["amount"],
+            category=item["category"],
+            note=item["note"],
         )
         markup = _undo_keyboard(expense_id) if expense_id else None
         await message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
-    except Exception as e:
-        logger.error("Error saving receipt expense: %s", e, exc_info=True)
-        await message.reply_text("⚠️ Gagal menyimpan pengeluaran. Coba lagi ya!")
+
+    if failed:
+        await message.reply_text(f"⚠️ {failed} item gagal disimpan karena error.")
 
 
 async def handle_undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
