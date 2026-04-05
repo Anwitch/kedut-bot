@@ -18,18 +18,19 @@ _UNDO_PREFIX = "undo:"
 _EDIT_CAT_PREFIX = "edit_cat:"
 _SET_CAT_PREFIX = "set_cat:"
 
-# All available categories with emoji icons
+# All available categories with emoji icons.
+# Names MUST exactly match the `name` column in the `categories` table.
 _CATEGORIES: list[tuple[str, str]] = [
-    ("Makan", "🍽"),
-    ("Transport", "🚗"),
-    ("Belanja", "🛒"),
-    ("Kesehatan", "💊"),
-    ("Hiburan", "🎮"),
-    ("Tagihan", "⚡"),
-    ("Pendidikan", "📚"),
-    ("Olahraga", "💪"),
-    ("Rumah", "🏠"),
-    ("Lainnya", "📌"),
+    ("Makan & Minum", "🍽️"),
+    ("Transport",     "🚗"),
+    ("Belanja",       "🛒"),
+    ("Kesehatan",     "💊"),
+    ("Hiburan",       "🎮"),
+    ("Tagihan",       "📋"),
+    ("Pendidikan",    "📚"),
+    ("Olahraga",      "🏃"),
+    ("Rumah",         "🏠"),
+    ("Lainnya",       "📌"),
 ]
 
 
@@ -50,8 +51,10 @@ def _category_picker_keyboard(expense_id: str) -> InlineKeyboardMarkup:
         )
         for name, icon in _CATEGORIES
     ]
-    # Pair buttons into rows of 2
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    # Pair buttons into rows of 2, except Lainnya gets its own row
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons) - 1, 2)]
+    if len(buttons) % 2 == 1:
+        rows.append([buttons[-1]])  # last item alone on last row
     return InlineKeyboardMarkup(rows)
 
 
