@@ -57,3 +57,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
+
+
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🔗 *Hubungkan ke Web Kedut*\n\n"
+        "Untuk melihat dashboard visual dan mengatur budget, hubungkan akun Telegrammu:\n\n"
+        "1. Buka dashboard Kedut di browser.\n"
+        "2. Login menggunakan akun Googlemu.\n"
+        "3. Klik ikon profil (👤) di pojok kanan atas.\n"
+        "4. Pilih 'Hubungkan Telegram'.\n\n"
+        "Setelah terhubung, semua catatanmu di sini otomatis sinkron!",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )

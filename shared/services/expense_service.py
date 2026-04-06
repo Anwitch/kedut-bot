@@ -8,7 +8,6 @@ from shared.database.supabase_client import get_supabase
 # ---------------------------------------------------------------------------
 _category_cache: dict[str, str] = {}
 
-
 def _get_category_cache() -> dict[str, str]:
     """Return the category name→id map, loading from DB if not yet cached."""
     global _category_cache
@@ -24,6 +23,33 @@ def _get_category_cache() -> dict[str, str]:
 
     return _category_cache
 
+_profile_id_cache: dict[str, str] = {}
+
+def _resolve_profile_id(telegram_id: str) -> str:
+    """Resolve Telegram ID to the internal Profile UUID. Find or Create."""
+    global _profile_id_cache
+    
+    # 1. Check cache
+    if telegram_id in _profile_id_cache:
+        return _profile_id_cache[telegram_id]
+
+    # 2. Check DB
+    db = get_supabase()
+    res = db.table("profiles").select("id").eq("telegram_id", str(telegram_id)).execute()
+    
+    if res.data:
+        profile_id = res.data[0]["id"]
+    else:
+        # 3. Create if not exists (Auto-registration via Telegram)
+        new_prof = db.table("profiles").insert({"telegram_id": str(telegram_id)}).execute()
+        if not new_prof.data:
+            # Fallback to prevent crash if table doesn't exist yet (migration pending)
+            return str(telegram_id)
+        profile_id = new_prof.data[0]["id"]
+    
+    # Update cache
+    _profile_id_cache[telegram_id] = profile_id
+    return profile_id
 
 def _resolve_category_id(category_name: str) -> Optional[str]:
     """Look up category id by name (case-insensitive). Falls back to 'Lainnya'."""
@@ -42,7 +68,6 @@ def _resolve_category_id(category_name: str) -> Optional[str]:
     # Final fallback: Lainnya
     return cache.get("Lainnya")
 
-
 def add_expense(
     user_id: str,
     amount: float,
@@ -53,6 +78,10 @@ def add_expense(
 ) -> dict:
     """Insert a new transaction row. Returns the created row."""
     db = get_supabase()
+    
+    # Resolve to UUID
+    p_id = _resolve_profile_id(user_id)
+    
     if expense_date is None:
         expense_date = date.today()
 
@@ -62,7 +91,7 @@ def add_expense(
         db.table("transactions")
         .insert(
             {
-                "user_id": str(user_id),
+                "user_id": p_id,
                 "amount": amount,
                 "category_id": category_id,
                 "note": note,
@@ -74,30 +103,30 @@ def add_expense(
     )
     return result.data[0] if result.data else {}
 
-
 def delete_expense(expense_id: str, user_id: str) -> bool:
     """
     Delete a transaction by id, scoped to user_id for safety.
     Returns True if a row was deleted, False otherwise.
     """
     db = get_supabase()
+    p_id = _resolve_profile_id(user_id)
     result = (
         db.table("transactions")
         .delete()
         .eq("id", expense_id)
-        .eq("user_id", str(user_id))
+        .eq("user_id", p_id)
         .execute()
     )
     return bool(result.data)
 
-
 def get_expenses(user_id: str, start_date: date, end_date: date) -> list[dict]:
     """Fetch expenses only (type='expense') for a user within a date range."""
     db = get_supabase()
+    p_id = _resolve_profile_id(user_id)
     result = (
         db.table("transactions")
         .select("id, amount, note, transaction_date, type, categories(name, icon)")
-        .eq("user_id", str(user_id))
+        .eq("user_id", p_id)
         .eq("type", "expense")
         .gte("transaction_date", start_date.isoformat())
         .lte("transaction_date", end_date.isoformat())
@@ -106,14 +135,14 @@ def get_expenses(user_id: str, start_date: date, end_date: date) -> list[dict]:
     )
     return result.data or []
 
-
 def get_transactions(user_id: str, start_date: date, end_date: date) -> list[dict]:
     """Fetch ALL transactions (income + expense) for a user within a date range."""
     db = get_supabase()
+    p_id = _resolve_profile_id(user_id)
     result = (
         db.table("transactions")
         .select("id, amount, note, transaction_date, type, categories(name, icon)")
-        .eq("user_id", str(user_id))
+        .eq("user_id", p_id)
         .gte("transaction_date", start_date.isoformat())
         .lte("transaction_date", end_date.isoformat())
         .order("transaction_date", desc=True)
@@ -126,24 +155,25 @@ def update_expense_category(expense_id: str, user_id: str, category_name: str) -
     if not category_id:
         return False
     db = get_supabase()
+    p_id = _resolve_profile_id(user_id)
     result = (
         db.table('transactions')
         .update({'category_id': category_id})
         .eq('id', expense_id)
-        .eq('user_id', str(user_id))
+        .eq('user_id', p_id)
         .execute()
     )
     return bool(result.data)
 
-
 def get_expense(expense_id: str, user_id: str) -> Optional[dict]:
     """Fetch a single transaction by id."""
     db = get_supabase()
+    p_id = _resolve_profile_id(user_id)
     result = (
         db.table("transactions")
         .select("id, amount, note, transaction_date, type, categories(name, icon)")
         .eq("id", expense_id)
-        .eq("user_id", str(user_id))
+        .eq("user_id", p_id)
         .execute()
     )
     return result.data[0] if result.data else None
