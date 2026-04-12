@@ -36,21 +36,28 @@ Kembalikan HANYA JSON dengan format ini (tanpa teks tambahan):
 {
   "type": "<expense atau income>",
   "amount": <angka float>,
-  "category": "<salah satu: Makan & Minum, Transport, Belanja, Kesehatan, Hiburan, Tagihan, Pendidikan, Olahraga, Rumah, Lainnya>",
+  "category": "<salah satu: Makan & Minum, Transport, Belanja, Kesehatan, Hiburan, Tagihan, Pendidikan, Olahraga, Rumah, Gaji, Freelance, Investasi, Transfer, Lainnya>",
   "note": "<deskripsi singkat>",
   "date": "<YYYY-MM-DD atau null jika hari ini>"
 }
 
 Aturan type:
-- Gunakan "income" jika pesan menyebut: gaji, terima, dapet, dapat, masuk, transfer masuk, freelance, honor, bonus, hasil jual, diterima, pendapatan, upah
+- Gunakan "income" jika pesan menyebut: gaji, terima, dapet, dapat, masuk, transfer masuk, freelance, honor, bonus, hasil jual, diterima, pendapatan, upah, proyek, gajian, dividen
 - Semua transaksi lain adalah "expense"
-- Untuk income, category boleh "Lainnya" jika tidak ada konteks yang cocok
+
+Aturan Category untuk Income:
+- Gaji: Pekerjaan tetap, bulanan, slip gaji
+- Freelance: Proyekan, side job, honor narasumber, jualan barang
+- Investasi: Dividen, profit saham, bunga bank, return reksadana
+- Transfer: Dapat kiriman uang, ditransfer mama/papa/teman
+- Lainnya: Jika tidak ada yang cocok
 
 Contoh:
 - "makan siang 35rb" → {"type": "expense", "amount": 35000, "category": "Makan & Minum", "note": "makan siang", "date": null}
 - "bayar listrik 250000" → {"type": "expense", "amount": 250000, "category": "Tagihan", "note": "bayar listrik", "date": null}
-- "gajian 5jt" → {"type": "income", "amount": 5000000, "category": "Lainnya", "note": "gaji", "date": null}
-- "dapet transfer 500rb dari client" → {"type": "income", "amount": 500000, "category": "Lainnya", "note": "transfer dari client", "date": null}
+- "gajian 5jt" → {"type": "income", "amount": 5000000, "category": "Gaji", "note": "Gaji", "date": null}
+- "proyek website 2jt" → {"type": "income", "amount": 2000000, "category": "Freelance", "note": "Proyek website", "date": null}
+- "dapet transfer 500rb dari client" → {"type": "income", "amount": 500000, "category": "Freelance", "note": "transfer dari client", "date": null}
 
 Aturan angka: 35rb=35000, 1.5jt=1500000, 1jt=1000000"""
 
@@ -87,7 +94,7 @@ _INCOME_KEYWORDS = [
     "gaji", "gajian", "slip gaji", "terima", "dapet", "dapat", "masuk",
     "transfer masuk", "diterima", "pendapatan", "pemasukan", "honor",
     "bonus", "freelance", "hasil jual", "upah", "komisi", "dividen",
-    "refund", "kembalian transfer",
+    "refund", "kembalian transfer", "proyek", "proyekan", "transfer",
 ]
 
 _CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
@@ -147,6 +154,13 @@ _CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
     ),
 ]
 
+_INCOME_CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
+    ("Gaji", ["gaji", "gajian", "slip", "bulanan", "payroll"]),
+    ("Freelance", ["proyek", "freelance", "honorar", "honor", "narasumber", "jualan", "laku", "proyekan"]),
+    ("Investasi", ["dividen", "saham", "crypto", "kripto", "reksadana", "invest", "bunga", "profit", "cuan"]),
+    ("Transfer", ["transfer", "kiriman", "ditransfer", "masuk dari", "go-pay", "gopay", "ovo", "dana"]),
+]
+
 # Relative date keywords in Indonesian
 _RELATIVE_DATES: list[tuple[list[str], int]] = [
     (["kemarin", "kemaren"], -1),
@@ -164,9 +178,10 @@ def _guess_type(text: str) -> str:
     return "expense"
 
 
-def _guess_category(note: str) -> str:
+def _guess_category(note: str, tx_type: str = "expense") -> str:
     lowered = note.lower()
-    for category, keywords in _CATEGORY_KEYWORDS:
+    pool = _CATEGORY_KEYWORDS if tx_type == "expense" else _INCOME_CATEGORY_KEYWORDS
+    for category, keywords in pool:
         if any(keyword in lowered for keyword in keywords):
             return category
     return "Lainnya"
@@ -326,7 +341,7 @@ def _parse_expense_local(text: str) -> dict | None:
     if not note:
         note = "Pemasukan" if tx_type == "income" else "Pengeluaran"
 
-    category = _guess_category(note) if tx_type == "expense" else "Lainnya"
+    category = _guess_category(note, tx_type)
     expense_date = _parse_relative_date(text)
 
     return {
