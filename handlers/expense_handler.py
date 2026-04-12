@@ -78,6 +78,64 @@ def _quota_error_message(e: GeminiQuotaExceeded) -> str:
         + "\n\nSementara itu, kamu bisa catat dulu di Notes terus masukin nanti."
     )
 
+async def _save_multiple_items_and_reply(items: list[dict], message, update: Update, user_id: str, is_photo: bool = False) -> None:
+    # Save each item and collect results
+    saved: list[tuple[dict, str | None]] = []  # (item, expense_id)
+    failed = 0
+    for item in items:
+        try:
+            if item["amount"] <= 0:
+                saved.append((item, None))
+                continue
+            row = add_expense(
+                user_id=user_id,
+                amount=item["amount"],
+                category_name=item["category"],
+                note=item["note"],
+                expense_date=item["date"],
+                transaction_type=item.get("type", "expense")
+            )
+            saved.append((item, row.get("id")))
+        except Exception as e:
+            logger.error("Error saving item '%s': %s", item.get("note"), e, exc_info=True)
+            failed += 1
+
+    if not saved and failed > 0:
+        await message.reply_text("⚠️ Gagal menyimpan transaksi. Coba lagi ya!")
+        return
+
+    # Summary header
+    valid_items = [(item, eid) for item, eid in saved if item["amount"] > 0]
+    total_income = sum(item["amount"] for item, _ in valid_items if item.get("type", "expense") == "income")
+    total_expense = sum(item["amount"] for item, _ in valid_items if item.get("type", "expense") == "expense")
+    ambiguous_count = sum(1 for item, _ in saved if item["amount"] <= 0)
+
+    emoji = "📷 *Struk berhasil dibaca!*" if is_photo else "✨ *Catatan berhasil!*"
+    header_lines = [f"{emoji} ({len(saved)} item)\n"]
+    if ambiguous_count:
+        header_lines.append(f"⚠️ _{ambiguous_count} item harga tidak terbaca (tandai ?)_\n")
+    if total_income > 0:
+        header_lines.append(f"🟢 *Total Pemasukan: Rp {total_income:,.0f}*")
+    if total_expense > 0:
+        header_lines.append(f"🔴 *Total Pengeluaran: Rp {total_expense:,.0f}*")
+        
+    await message.reply_text("\n".join(header_lines), parse_mode="Markdown")
+
+    for item, expense_id in saved:
+        msg = format_expense_confirmation(
+            amount=item["amount"],
+            category=item["category"],
+            note=item["note"],
+        )
+        type_label = "💸 *Pengeluaran dicatat!*" if item.get("type", "expense") == "expense" else "💰 *Pemasukan dicatat!*"
+        msg = f"{type_label}\n{msg}" if not is_photo else msg
+        markup = _action_keyboard(expense_id) if expense_id else None
+        await message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
+
+    if failed:
+        await message.reply_text(f"⚠️ Gagal menyimpan {failed} item lainnya.")
+
+
 @require_registered
 @rate_limited
 async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,44 +152,20 @@ async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(_quota_error_message(e))
         return
 
-    if not parsed or parsed["amount"] <= 0:
+    items = parsed.get("items", []) if parsed else []
+
+    if not items:
         await update.message.reply_text(
             "❓ Maaf, aku tidak bisa memahami transaksi itu.\n\n"
             "Coba format seperti:\n"
             "`makan siang 35rb`\n"
-            "`bayar listrik 250000`\n"
+            "`bayar listrik 250000 dan air 50k`\n"
             "`gajian 5jt`",
             parse_mode="Markdown",
         )
         return
 
-    tx_type = parsed.get("type", "expense")
-
-    try:
-        row = add_expense(
-            user_id=user_id,
-            amount=parsed["amount"],
-            category_name=parsed["category"],
-            note=parsed["note"],
-            expense_date=parsed["date"],
-            transaction_type=tx_type,
-        )
-        expense_id = row.get("id")
-        msg = format_expense_confirmation(
-            amount=parsed["amount"],
-            category=parsed["category"],
-            note=parsed["note"],
-        )
-        # Prefix label sesuai tipe
-        type_label = "💸 *Pengeluaran dicatat!*" if tx_type == "expense" else "💰 *Pemasukan dicatat!*"
-        msg = f"{type_label}\n{msg}"
-        markup = _action_keyboard(expense_id) if expense_id else None
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Error saving transaction: {e}")
-        await update.message.reply_text(
-            "⚠️ Gagal menyimpan transaksi. Coba lagi ya!"
-        )
+    await _save_multiple_items_and_reply(items, update.message, update, user_id, is_photo=False)
 
 
 @require_registered
@@ -171,54 +205,7 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # Save each item and collect results
-    saved: list[tuple[dict, str | None]] = []  # (item, expense_id)
-    failed = 0
-    for item in items:
-        try:
-            # Skip items with ambiguous (zero) amounts — flagged with (?)
-            if item["amount"] <= 0:
-                saved.append((item, None))
-                continue
-            row = add_expense(
-                user_id=user_id,
-                amount=item["amount"],
-                category_name=item["category"],
-                note=item["note"],
-                expense_date=item["date"],
-            )
-            saved.append((item, row.get("id")))
-        except Exception as e:
-            logger.error("Error saving receipt item '%s': %s", item.get("note"), e, exc_info=True)
-            failed += 1
-
-    if not saved and failed > 0:
-        await message.reply_text("⚠️ Gagal menyimpan semua item. Coba lagi ya!")
-        return
-
-    # Summary header
-    valid_items = [(item, eid) for item, eid in saved if item["amount"] > 0]
-    grand_total = sum(item["amount"] for item, _ in valid_items)
-    ambiguous_count = sum(1 for item, _ in saved if item["amount"] <= 0)
-
-    header_lines = [f"📷 *Struk berhasil dibaca!* ({len(saved)} item)\n"]
-    if ambiguous_count:
-        header_lines.append(f"⚠️ _{ambiguous_count} item harga tidak terbaca (tandai ?)_\n")
-    header_lines.append(f"💰 *Total: Rp {grand_total:,.0f}*")
-    await message.reply_text("\n".join(header_lines), parse_mode="Markdown")
-
-    # One message per item with individual undo button
-    for item, expense_id in saved:
-        msg = format_expense_confirmation(
-            amount=item["amount"],
-            category=item["category"],
-            note=item["note"],
-        )
-        markup = _action_keyboard(expense_id) if expense_id else None
-        await message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
-
-    if failed:
-        await message.reply_text(f"⚠️ {failed} item gagal disimpan karena error.")
+    await _save_multiple_items_and_reply(items, message, update, user_id, is_photo=True)
 
 
 async def handle_undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -29,16 +29,20 @@ class GeminiQuotaExceeded(Exception):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
 
-SYSTEM_PROMPT = """Kamu adalah asisten keuangan. Tugasmu adalah mengekstrak informasi transaksi keuangan dari pesan pengguna.
+SYSTEM_PROMPT = """Kamu adalah asisten keuangan Kedut. Tugasmu adalah mengekstrak SATU ATAU LEBIH informasi transaksi keuangan dari pesan pengguna.
 Transaksi bisa berupa PENGELUARAN (expense) atau PEMASUKAN (income).
 
 Kembalikan HANYA JSON dengan format ini (tanpa teks tambahan):
 {
-  "type": "<expense atau income>",
-  "amount": <angka float>,
-  "category": "<salah satu: Makan & Minum, Transport, Belanja, Kesehatan, Hiburan, Tagihan, Pendidikan, Olahraga, Rumah, Gaji, Freelance, Investasi, Transfer, Lainnya>",
-  "note": "<deskripsi singkat>",
-  "date": "<YYYY-MM-DD atau null jika hari ini>"
+  "items": [
+    {
+      "type": "<expense atau income>",
+      "amount": <angka float>,
+      "category": "<salah satu: Makan & Minum, Transport, Belanja, Kesehatan, Hiburan, Tagihan, Pendidikan, Olahraga, Rumah, Gaji, Freelance, Investasi, Transfer, Lainnya>",
+      "note": "<deskripsi singkat>",
+      "date": "<YYYY-MM-DD atau null jika hari ini>"
+    }
+  ]
 }
 
 Aturan type:
@@ -53,11 +57,9 @@ Aturan Category untuk Income:
 - Lainnya: Jika tidak ada yang cocok
 
 Contoh:
-- "makan siang 35rb" → {"type": "expense", "amount": 35000, "category": "Makan & Minum", "note": "makan siang", "date": null}
-- "bayar listrik 250000" → {"type": "expense", "amount": 250000, "category": "Tagihan", "note": "bayar listrik", "date": null}
-- "gajian 5jt" → {"type": "income", "amount": 5000000, "category": "Gaji", "note": "Gaji", "date": null}
-- "proyek website 2jt" → {"type": "income", "amount": 2000000, "category": "Freelance", "note": "Proyek website", "date": null}
-- "dapet transfer 500rb dari client" → {"type": "income", "amount": 500000, "category": "Freelance", "note": "transfer dari client", "date": null}
+- "makan siang 35rb" → {"items": [{"type": "expense", "amount": 35000, "category": "Makan & Minum", "note": "makan siang", "date": null}]}
+- "bayar listrik 250000 dan air 100k" → {"items": [{"type": "expense", "amount": 250000, "category": "Tagihan", "note": "bayar listrik", "date": null}, {"type": "expense", "amount": 100000, "category": "Tagihan", "note": "air", "date": null}]}
+- "gajian 5jt, sedekah 100rb" → {"items": [{"type": "income", "amount": 5000000, "category": "Gaji", "note": "Gaji", "date": null}, {"type": "expense", "amount": 100000, "category": "Lainnya", "note": "sedekah", "date": null}]}
 
 Aturan angka: 35rb=35000, 1.5jt=1500000, 1jt=1000000"""
 
@@ -353,6 +355,20 @@ def _parse_expense_local(text: str) -> dict | None:
     }
 
 
+def _parse_local_multiple(text: str) -> list[dict]:
+    """Splits text by comma or 'dan' to parse multiple items locally."""
+    # Split the input text into phrases
+    phrases = re.split(r"(?i)\s*(?:,|\bdan\b|\bterus\b|\bserta\b)\s*", text)
+    items = []
+    for phrase in phrases:
+        if not phrase.strip():
+            continue
+        parsed = _parse_expense_local(phrase)
+        if parsed and parsed.get("amount", 0) > 0:
+            items.append(parsed)
+    return items
+
+
 def _extract_json(raw: str) -> str:
     """Best-effort extraction of a JSON object from a model response."""
     cleaned = raw.strip()
@@ -427,16 +443,10 @@ def parse_expense(text: str) -> dict | None:
     )
 
     if has_suffix:
-        local = _parse_expense_local(text)
-        if local and local.get("amount", 0) > 0:
-            logger.info(
-                "Local parse (suffixed) success: type=%s amount=%s category=%s note=%s",
-                local.get("type"),
-                local["amount"],
-                local["category"],
-                local["note"],
-            )
-            return local
+        local_items = _parse_local_multiple(text)
+        if local_items:
+            logger.info("Local parse (multiple) success. Found %d items.", len(local_items))
+            return {"items": local_items}
 
     # 2) Gemini parse for ambiguous / complex inputs
     try:
@@ -452,32 +462,41 @@ def parse_expense(text: str) -> dict | None:
 
         raw_json = _extract_json(raw)
         data = json.loads(raw_json)
+        items_raw = data.get("items", [])
+        
+        if not items_raw and "amount" in data and "category" in data:
+            items_raw = [data]
 
-        # Parse date — Gemini may return a relative label or ISO string
-        tx_date = _parse_relative_date(text)  # prefer local date parse
-        if data.get("date") and str(data["date"]).lower() not in ("null", "none", ""):
-            try:
-                tx_date = date.fromisoformat(str(data["date"]))
-            except ValueError:
-                tx_date = _parse_relative_date(text)
+        parsed_items = []
+        tx_date_global = _parse_relative_date(text)
 
-        # Validate type field from Gemini; fall back to local detection
-        gemini_type = str(data.get("type", "")).lower()
-        tx_type = gemini_type if gemini_type in ("expense", "income") else _guess_type(text)
+        for itItem in items_raw:
+            tx_date = tx_date_global
+            if itItem.get("date") and str(itItem["date"]).lower() not in ("null", "none", ""):
+                try:
+                    tx_date = date.fromisoformat(str(itItem["date"]))
+                except ValueError:
+                    pass
+            
+            gemini_type = str(itItem.get("type", "")).lower()
+            tx_type = gemini_type if gemini_type in ("expense", "income") else _guess_type(text)
 
-        parsed = {
-            "type": tx_type,
-            "amount": _coerce_amount(data.get("amount", 0)),
-            "category": str(data.get("category", "Lainnya")),
-            "note": str(data.get("note", "")),
-            "date": tx_date,
-        }
+            parsed_amount = _coerce_amount(itItem.get("amount", 0))
+            if parsed_amount > 0:
+                parsed_items.append({
+                    "type": tx_type,
+                    "amount": parsed_amount,
+                    "category": str(itItem.get("category", "Lainnya")),
+                    "note": str(itItem.get("note", text)),
+                    "date": tx_date,
+                })
 
-        if parsed["amount"] <= 0:
-            logger.warning("Gemini returned amount <= 0, falling back to local.")
-            return _parse_expense_local(text)
+        if not parsed_items:
+            logger.warning("Gemini returned no valid items, falling back to local.")
+            fallback = _parse_local_multiple(text)
+            return {"items": fallback} if fallback else None
 
-        return parsed
+        return {"items": parsed_items}
 
     except Exception as e:
         if _is_quota_error(e):
@@ -487,7 +506,8 @@ def parse_expense(text: str) -> dict | None:
 
         logger.error("Gemini parse failed: %s", e, exc_info=True)
         # Last resort: local parse even without suffix
-        return _parse_expense_local(text)
+        fallback = _parse_local_multiple(text)
+        return {"items": fallback} if fallback else None
 
 
 def parse_expense_from_receipt_image(
