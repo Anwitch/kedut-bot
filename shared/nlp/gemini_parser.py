@@ -205,6 +205,42 @@ def _parse_relative_date(text: str) -> date:
     return date.today()
 
 
+MAX_AMOUNT = 99_999_999_999
+
+VALID_CATEGORIES = {
+    "Makan & Minum", "Transport", "Belanja", "Kesehatan",
+    "Hiburan", "Tagihan", "Pendidikan", "Olahraga", "Rumah",
+    "Gaji", "Freelance", "Investasi", "Transfer", "Lainnya"
+}
+
+def _normalize_indonesian_amount(text: str) -> str:
+    # "2jt500rb" → 2_500_000
+    text = re.sub(r'(?i)(\d+)\s*jt\s*(\d{1,3})\s*(?:rb|ribu|k)\b',
+                  lambda m: str(int(m.group(1)) * 1_000_000 + int(m.group(2)) * 1_000),
+                  text)
+    # "2jt500" → 2_500_000 (dibaca: 2 juta 500 ribu)
+    text = re.sub(r'(?i)(\d+)\s*jt\s*(\d{1,3})\b',
+                  lambda m: str(int(m.group(1)) * 1_000_000 + int(m.group(2)) * 1_000),
+                  text)
+    # "1rb500" → 1_500
+    text = re.sub(r'(?i)(\d+)\s*(?:rb|ribu|k)\s*(\d{1,3})\b(?!\s*(?:rb|ribu|jt|juta|k))',
+                  lambda m: str(int(m.group(1)) * 1_000 + int(m.group(2))),
+                  text)
+    return text
+
+def _sanitize_item(item: dict) -> dict:
+    """Mutates and returns sanitized item. Raises ValueError if invalid."""
+    if str(item.get("type", "")).lower() not in ("expense", "income"):
+        raise ValueError("invalid type")
+    amount = float(_coerce_amount(item.get("amount", 0)))
+    if not (0 < amount <= MAX_AMOUNT):
+        raise ValueError("invalid amount")
+    item["amount"] = amount
+    if item.get("category") not in VALID_CATEGORIES:
+        item["category"] = "Lainnya"
+    item["note"] = str(item.get("note", ""))[:200].strip() or "Transaksi"
+    return item
+
 def _normalize_number_str(num_str: str) -> str:
     """
     Normalize Indonesian/European thousand-separator formats to a plain float string.
@@ -328,17 +364,18 @@ def _clean_note(raw: str) -> str:
     return cleaned.capitalize() if cleaned else "pengeluaran"
 
 
-def _parse_expense_local(text: str) -> dict | None:
-    amount, token = _parse_amount_local(text)
+def _parse_expense_local(text: str, default_date: date | None = None) -> dict | None:
+    normalized_text = _normalize_indonesian_amount(text)
+    amount, token = _parse_amount_local(normalized_text)
     if amount is None or token is None:
         return None
 
     # Remove the amount token from the note
-    note = text
+    note = normalized_text
     try:
         note = re.sub(re.escape(token), "", note, count=1, flags=re.IGNORECASE).strip()
     except re.error:
-        note = text
+        note = normalized_text
 
     # Strip relative date keywords from note
     for keywords, _ in _RELATIVE_DATES:
@@ -351,7 +388,7 @@ def _parse_expense_local(text: str) -> dict | None:
         note = "Pemasukan" if tx_type == "income" else "Pengeluaran"
 
     category = _guess_category(note, tx_type)
-    expense_date = _parse_relative_date(text)
+    expense_date = default_date or _parse_relative_date(text)
 
     return {
         "type": tx_type,
@@ -362,15 +399,16 @@ def _parse_expense_local(text: str) -> dict | None:
     }
 
 
-def _parse_local_multiple(text: str) -> list[dict]:
+def _parse_local_multiple(text: str, default_date: date | None = None) -> list[dict]:
     """Splits text by comma or 'dan' to parse multiple items locally."""
+    default_date = default_date or _parse_relative_date(text)
     # Split the input text into phrases
     phrases = re.split(r"(?i)\s*(?:,|\bdan\b|\bterus\b|\bserta\b)\s*", text)
     items = []
     for phrase in phrases:
         if not phrase.strip():
             continue
-        parsed = _parse_expense_local(phrase)
+        parsed = _parse_expense_local(phrase, default_date=default_date)
         if parsed and parsed.get("amount", 0) > 0:
             items.append(parsed)
     return items
@@ -439,17 +477,24 @@ def parse_expense(text: str) -> dict | None:
       3. Gemini parse for complex or ambiguous inputs.
       4. Final fallback to local parse if Gemini fails.
     """
+    text = text.strip()[:500]
+    if not text:
+        return None
+
     if not _is_transaction_input(text):
         logger.info("Non-transaction input detected, skipping parse: %s", text)
         return None
 
     # 1) Try local parse — only trust it if there's an explicit suffix
-    amount, token = _parse_amount_local(text)
-    has_suffix = token is not None and bool(
-        re.search(r"(?i)(rb|ribu|jt|juta|k)\b", token)
-    )
+    normalized_text = _normalize_indonesian_amount(text)
+    all_tokens = re.findall(r'\d+(?:[.,]\d+)?\s*(?:rb|ribu|jt|juta|k)\b', normalized_text, re.IGNORECASE)
+    text_no_suffix = re.sub(r'\d+(?:[.,]\d+)?\s*(?:rb|ribu|jt|juta|k)\b', '', normalized_text, flags=re.IGNORECASE)
+    bare_numbers = re.findall(r'\b\d{4,}\b', text_no_suffix)
+    
+    has_suffix = bool(all_tokens)
+    has_bare = bool(bare_numbers)
 
-    if has_suffix:
+    if has_suffix and not has_bare:
         local_items = _parse_local_multiple(text)
         if local_items:
             logger.info("Local parse (multiple) success. Found %d items.", len(local_items))
@@ -457,13 +502,13 @@ def parse_expense(text: str) -> dict | None:
 
     # 2) Gemini parse for ambiguous / complex inputs
     try:
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"Pesan user: \"{text}\"\n\n"
-            f"Hari ini: {date.today().isoformat()}"
-        )
+        contents = [
+            {"role": "user", "parts": [SYSTEM_PROMPT]},
+            {"role": "model", "parts": ['{"items": []}']},
+            {"role": "user", "parts": [f'Pesan: "{text}"\nHari ini: {date.today().isoformat()}']}
+        ]
         logger.info("Gemini model=%s input=%s", _MODEL_NAME, text)
-        response = _model.generate_content(prompt)
+        response = _model.generate_content(contents)
         raw = (response.text or "").strip()
         logger.info("Gemini raw response: %s", raw)
 
@@ -487,16 +532,19 @@ def parse_expense(text: str) -> dict | None:
             
             gemini_type = str(itItem.get("type", "")).lower()
             tx_type = gemini_type if gemini_type in ("expense", "income") else _guess_type(text)
+            itItem["type"] = tx_type
 
-            parsed_amount = _coerce_amount(itItem.get("amount", 0))
-            if parsed_amount > 0:
+            try:
+                sanitized = _sanitize_item(itItem)
                 parsed_items.append({
-                    "type": tx_type,
-                    "amount": parsed_amount,
-                    "category": str(itItem.get("category", "Lainnya")),
-                    "note": str(itItem.get("note", text)),
+                    "type": sanitized["type"],
+                    "amount": sanitized["amount"],
+                    "category": sanitized["category"],
+                    "note": sanitized["note"],
                     "date": tx_date,
                 })
+            except ValueError:
+                pass
 
         if not parsed_items:
             logger.warning("Gemini returned no valid items, falling back to local.")
