@@ -1,10 +1,23 @@
+"""
+gemini_parser.py — Orchestrator for Kedut's hybrid transaction parser.
+
+Flow for parse_expense(text):
+  1. Guard: reject obvious non-transaction messages.
+  2. Fast path: try rule_parser.parse_local_transaction(text).
+     If confidence == HIGH → return immediately (no API call).
+  3. Slow path: call Gemini for complex / ambiguous inputs.
+  4. Fallback: if Gemini fails, return whatever the rule parser found.
+
+Receipt image parsing (parse_expense_from_receipt_image) always uses Gemini.
+"""
+
 import json
 import logging
+import math
 import os
 import re
-from datetime import date, timedelta
+from datetime import date
 from io import BytesIO
-import math
 
 import google.generativeai as genai
 
@@ -14,6 +27,19 @@ except Exception:  # pragma: no cover
     ResourceExhausted = None  # type: ignore
 
 from shared.config import settings
+from shared.nlp.rule_parser import (
+    Confidence,
+    VALID_CATEGORIES,
+    _coerce_amount,
+    _guess_type,
+    _parse_local_multiple,
+    _parse_relative_date,
+    parse_local_transaction,
+)
+
+# ---------------------------------------------------------------------------
+# Gemini client setup
+# ---------------------------------------------------------------------------
 
 _MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 genai.configure(api_key=settings.GEMINI_API_KEY)
@@ -24,10 +50,19 @@ _model = genai.GenerativeModel(_MODEL_NAME, generation_config=_GENERATION_CONFIG
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
 class GeminiQuotaExceeded(Exception):
     def __init__(self, message: str, retry_after_seconds: int | None = None):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """Kamu adalah asisten keuangan Kedut. Tugasmu adalah mengekstrak MAKSIMAL 10 transaksi keuangan dari pesan pengguna.
 Transaksi bisa berupa PENGELUARAN (expense) atau PEMASUKAN (income).
@@ -98,321 +133,9 @@ Aturan:
 """
 
 
-# Income keywords — used to detect type before categorising
-_INCOME_KEYWORDS = [
-    "gaji", "gajian", "slip gaji", "terima", "dapet", "dapat", "masuk",
-    "transfer masuk", "diterima", "pendapatan", "pemasukan", "honor",
-    "bonus", "freelance", "hasil jual", "upah", "komisi", "dividen",
-    "refund", "kembalian transfer", "proyek", "proyekan", "transfer",
-]
-
-_CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
-    (
-        "Tagihan",
-        ["listrik", "air", "pln", "wifi", "internet", "token", "pulsa", "bpjs", "cicilan", "iuran"],
-    ),
-    (
-        "Makan & Minum",
-        [
-            "makan", "sarapan", "siang", "malam", "nasi", "kopi", "ayam", "bakso",
-            "minum", "resto", "restoran", "warung", "cafe", "kafe", "snack", "jajan",
-            "pizza", "burger", "mie", "soto", "pecel", "gado", "bubur",
-        ],
-    ),
-    (
-        "Transport",
-        [
-            "gojek", "grab", "ojek", "bensin", "bbm", "parkir", "tol", "taksi",
-            "bus", "kereta", "motor", "mobil", "uber", "angkot", "transjakarta",
-            "commuter", "krl", "mrt", "lrt",
-        ],
-    ),
-    (
-        "Belanja",
-        [
-            "beli", "belanja", "market", "indomaret", "alfamart", "supermarket",
-            "tokopedia", "shopee", "lazada", "toko", "minimarket", "hypermart",
-            "carrefour", "ikea",
-        ],
-    ),
-    (
-        "Kesehatan",
-        ["obat", "dokter", "rs", "rumah sakit", "apotek", "klinik", "vitamin", "suplemen"],
-    ),
-    (
-        "Pendidikan",
-        ["buku", "kursus", "kuliah", "sekolah", "les", "kelas", "workshop", "seminar", "udemy"],
-    ),
-    (
-        "Hiburan",
-        [
-            "nonton", "film", "game", "spotify", "netflix", "hiburan", "bioskop",
-            "youtube", "disney", "konser", "event",
-        ],
-    ),
-    (
-        "Olahraga",
-        ["gym", "fitness", "renang", "futsal", "badminton", "sepatu olahraga", "olahraga"],
-    ),
-    (
-        "Rumah",
-        [
-            "sewa", "kontrakan", "kos", "perabot", "service", "servis", "listrik rumah",
-            "furnitur", "cat", "renovasi",
-        ],
-    ),
-]
-
-_INCOME_CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
-    ("Gaji", ["gaji", "gajian", "slip", "bulanan", "payroll"]),
-    ("Freelance", ["proyek", "freelance", "honorar", "honor", "narasumber", "jualan", "laku", "proyekan"]),
-    ("Investasi", ["dividen", "saham", "crypto", "kripto", "reksadana", "invest", "bunga", "profit", "cuan"]),
-    ("Transfer", ["transfer", "kiriman", "ditransfer", "masuk dari", "go-pay", "gopay", "ovo", "dana"]),
-]
-
-# Relative date keywords in Indonesian
-_RELATIVE_DATES: list[tuple[list[str], int]] = [
-    (["kemarin", "kemaren"], -1),
-    (["2 hari lalu", "dua hari lalu"], -2),
-    (["3 hari lalu", "tiga hari lalu"], -3),
-    (["minggu lalu", "seminggu lalu"], -7),
-]
-
-
-def _guess_type(text: str) -> str:
-    """Return 'income' if text contains income keywords, else 'expense'."""
-    lowered = text.lower()
-    if any(kw in lowered for kw in _INCOME_KEYWORDS):
-        return "income"
-    return "expense"
-
-
-def _guess_category(note: str, tx_type: str = "expense") -> str:
-    lowered = note.lower()
-    pool = _CATEGORY_KEYWORDS if tx_type == "expense" else _INCOME_CATEGORY_KEYWORDS
-    for category, keywords in pool:
-        if any(keyword in lowered for keyword in keywords):
-            return category
-    return "Lainnya"
-
-
-def _parse_relative_date(text: str) -> date:
-    """Return a date offset from today if a relative keyword is found, else today."""
-    lowered = text.lower()
-    for keywords, offset in _RELATIVE_DATES:
-        if any(kw in lowered for kw in keywords):
-            return date.today() + timedelta(days=offset)
-    return date.today()
-
-
-MAX_AMOUNT = 99_999_999_999
-
-VALID_CATEGORIES = {
-    "Makan & Minum", "Transport", "Belanja", "Kesehatan",
-    "Hiburan", "Tagihan", "Pendidikan", "Olahraga", "Rumah",
-    "Gaji", "Freelance", "Investasi", "Transfer", "Lainnya"
-}
-
-def _normalize_indonesian_amount(text: str) -> str:
-    # "2jt500rb" → 2_500_000
-    text = re.sub(r'(?i)(\d+)\s*jt\s*(\d{1,3})\s*(?:rb|ribu|k)\b',
-                  lambda m: str(int(m.group(1)) * 1_000_000 + int(m.group(2)) * 1_000),
-                  text)
-    # "2jt500" → 2_500_000 (dibaca: 2 juta 500 ribu)
-    text = re.sub(r'(?i)(\d+)\s*jt\s*(\d{1,3})\b',
-                  lambda m: str(int(m.group(1)) * 1_000_000 + int(m.group(2)) * 1_000),
-                  text)
-    # "1rb500" → 1_500
-    text = re.sub(r'(?i)(\d+)\s*(?:rb|ribu|k)\s*(\d{1,3})\b(?!\s*(?:rb|ribu|jt|juta|k))',
-                  lambda m: str(int(m.group(1)) * 1_000 + int(m.group(2))),
-                  text)
-    return text
-
-def _sanitize_item(item: dict) -> dict:
-    """Mutates and returns sanitized item. Raises ValueError if invalid."""
-    if str(item.get("type", "")).lower() not in ("expense", "income"):
-        raise ValueError("invalid type")
-    amount = float(_coerce_amount(item.get("amount", 0)))
-    if not (0 < amount <= MAX_AMOUNT):
-        raise ValueError("invalid amount")
-    item["amount"] = amount
-    if item.get("category") not in VALID_CATEGORIES:
-        item["category"] = "Lainnya"
-    item["note"] = str(item.get("note", ""))[:200].strip() or "Transaksi"
-    return item
-
-def _normalize_number_str(num_str: str) -> str:
-    """
-    Normalize Indonesian/European thousand-separator formats to a plain float string.
-    Examples:
-      "1.500.000" → "1500000"
-      "1.500"     → "1500"    (assumed thousands, not decimal)
-      "1,5"       → "1.5"
-      "150000"    → "150000"
-    """
-    dot_count = num_str.count(".")
-    comma_count = num_str.count(",")
-
-    if dot_count > 1:
-        # e.g. "1.500.000" — dots are thousand separators
-        return num_str.replace(".", "")
-    if comma_count > 0 and dot_count == 0:
-        # e.g. "1,5" or "1,500" — treat comma as decimal separator
-        return num_str.replace(",", ".")
-    if dot_count == 1 and comma_count == 0:
-        # Ambiguous: "1.500" could be 1500 or 1.5
-        # If the fractional part has exactly 3 digits → thousand separator
-        parts = num_str.split(".")
-        if len(parts[1]) == 3:
-            return num_str.replace(".", "")
-        # Otherwise treat as decimal (e.g. "1.5jt")
-        return num_str
-    # No separators
-    return num_str
-
-
-def _coerce_amount(value) -> float:
-    """Convert model-provided amount value into a float (supports Indonesian separators)."""
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    text = str(value).strip()
-    if not text:
-        return 0.0
-
-    # Strip common currency markers
-    text = re.sub(r"(?i)rp\.?\s*", "", text)
-    text = text.replace("IDR", "").replace("idr", "")
-    text = re.sub(r"\s+", "", text)
-    # Keep only digits and separators
-    text = re.sub(r"[^0-9,\.]", "", text)
-    if not text:
-        return 0.0
-
-    try:
-        normalized = _normalize_number_str(text)
-        return float(normalized)
-    except Exception:
-        return 0.0
-
-
-def _parse_amount_local(text: str) -> tuple[float, str] | tuple[None, None]:
-    """
-    Return (amount, matched_token) for the most significant amount found in text,
-    or (None, None) if nothing is found.
-
-    Strategy: collect all matches, prefer those with an explicit rb/jt suffix
-    (they are unambiguous), otherwise take the largest numeric value.
-    """
-    pattern = re.compile(
-        r"(?i)(?P<num>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)"
-        r"\s*(?P<suffix>rb|ribu|jt|juta|k)?\b"
-    )
-    matches = list(pattern.finditer(text))
-    if not matches:
-        return None, None
-
-    candidates: list[tuple[float, str, bool]] = []  # (value, token, has_suffix)
-    for m in matches:
-        num_str = _normalize_number_str(m.group("num"))
-        suffix = (m.group("suffix") or "").lower()
-        try:
-            value = float(num_str)
-        except ValueError:
-            continue
-
-        if suffix in {"rb", "ribu", "k"}:
-            value *= 1_000
-        elif suffix in {"jt", "juta"}:
-            value *= 1_000_000
-
-        if value <= 0:
-            continue
-        candidates.append((float(int(value)), m.group(0), bool(suffix)))
-
-    if not candidates:
-        return None, None
-
-    # Prefer suffixed candidates (unambiguous), then pick the largest value
-    suffixed = [c for c in candidates if c[2]]
-    pool = suffixed if suffixed else candidates
-    best = max(pool, key=lambda c: c[0])
-    return best[0], best[1]
-
-
-# Noise words that don't contribute to the expense description.
-# These are stripped from the note after removing the amount token.
-_NOISE_WORDS = re.compile(
-    r"(?i)\b("
-    r"aku|saya|gue|gw|ane|w|"
-    r"tadi|tadi(?:nya)?|ini|itu|"
-    r"harga(?:nya)?|bayar|bayarin|beli(?:in)?|buat|untuk|dgn|dengan|"
-    r"sebesar|senilai|seharga|totalnya|total|sebanyak|"
-    r"di|ke|dari|yang|yg|dan|juga|udah|sudah|udh|"
-    r"nya|lah|deh|dong|nih|sih|ya|yaa|wkwk"
-    r")\b"
-)
-
-
-def _clean_note(raw: str) -> str:
-    """Remove noise words and tidy up whitespace from a note string."""
-    cleaned = _NOISE_WORDS.sub(" ", raw)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip("-–—:;,. ")
-    # Capitalize first letter
-    return cleaned.capitalize() if cleaned else "pengeluaran"
-
-
-def _parse_expense_local(text: str, default_date: date | None = None) -> dict | None:
-    normalized_text = _normalize_indonesian_amount(text)
-    amount, token = _parse_amount_local(normalized_text)
-    if amount is None or token is None:
-        return None
-
-    # Remove the amount token from the note
-    note = normalized_text
-    try:
-        note = re.sub(re.escape(token), "", note, count=1, flags=re.IGNORECASE).strip()
-    except re.error:
-        note = normalized_text
-
-    # Strip relative date keywords from note
-    for keywords, _ in _RELATIVE_DATES:
-        for kw in keywords:
-            note = re.sub(re.escape(kw), "", note, flags=re.IGNORECASE)
-
-    tx_type = _guess_type(text)
-    note = _clean_note(note)
-    if not note:
-        note = "Pemasukan" if tx_type == "income" else "Pengeluaran"
-
-    category = _guess_category(note, tx_type)
-    expense_date = default_date or _parse_relative_date(text)
-
-    return {
-        "type": tx_type,
-        "amount": float(amount),
-        "category": category,
-        "note": note,
-        "date": expense_date,
-    }
-
-
-def _parse_local_multiple(text: str, default_date: date | None = None) -> list[dict]:
-    """Splits text by comma or 'dan' to parse multiple items locally."""
-    default_date = default_date or _parse_relative_date(text)
-    # Split the input text into phrases
-    phrases = re.split(r"(?i)\s*(?:,|\bdan\b|\bterus\b|\bserta\b)\s*", text)
-    items = []
-    for phrase in phrases:
-        if not phrase.strip():
-            continue
-        parsed = _parse_expense_local(phrase, default_date=default_date)
-        if parsed and parsed.get("amount", 0) > 0:
-            items.append(parsed)
-    return items
-
+# ---------------------------------------------------------------------------
+# Internal helpers (Gemini-specific)
+# ---------------------------------------------------------------------------
 
 def _extract_json(raw: str) -> str:
     """Best-effort extraction of a JSON object from a model response."""
@@ -421,7 +144,7 @@ def _extract_json(raw: str) -> str:
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
-        return cleaned[start : end + 1]
+        return cleaned[start: end + 1]
     return cleaned
 
 
@@ -465,6 +188,25 @@ def _is_transaction_input(text: str) -> bool:
 _is_expense_input = _is_transaction_input
 
 
+def _sanitize_item(item: dict) -> dict:
+    """Mutates and returns sanitized item. Raises ValueError if invalid."""
+    MAX_AMOUNT = 99_999_999_999
+    if str(item.get("type", "")).lower() not in ("expense", "income"):
+        raise ValueError("invalid type")
+    amount = float(_coerce_amount(item.get("amount", 0)))
+    if not (0 < amount <= MAX_AMOUNT):
+        raise ValueError("invalid amount")
+    item["amount"] = amount
+    if item.get("category") not in VALID_CATEGORIES:
+        item["category"] = "Lainnya"
+    item["note"] = str(item.get("note", ""))[:200].strip() or "Transaksi"
+    return item
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def parse_expense(text: str) -> dict | None:
     """
     Parse natural language transaction (expense OR income) from user text.
@@ -472,8 +214,8 @@ def parse_expense(text: str) -> dict | None:
 
     Flow:
       1. Guard against obvious non-transaction messages.
-      2. Local parse for common patterns (fast, works offline).
-         Only returns early if a suffixed amount (rb/jt/k) is found — unambiguous.
+      2. Local parse (rule_parser) — returns early if confidence is HIGH.
+         HIGH = explicit suffix (rb/k/jt) found and no leftover ambiguous numbers.
       3. Gemini parse for complex or ambiguous inputs.
       4. Final fallback to local parse if Gemini fails.
     """
@@ -485,22 +227,15 @@ def parse_expense(text: str) -> dict | None:
         logger.info("Non-transaction input detected, skipping parse: %s", text)
         return None
 
-    # 1) Try local parse — only trust it if there's an explicit suffix
-    normalized_text = _normalize_indonesian_amount(text)
-    all_tokens = re.findall(r'\d+(?:[.,]\d+)?\s*(?:rb|ribu|jt|juta|k)\b', normalized_text, re.IGNORECASE)
-    text_no_suffix = re.sub(r'\d+(?:[.,]\d+)?\s*(?:rb|ribu|jt|juta|k)\b', '', normalized_text, flags=re.IGNORECASE)
-    bare_numbers = re.findall(r'\b\d{4,}\b', text_no_suffix)
-    
-    has_suffix = bool(all_tokens)
-    has_bare = bool(bare_numbers)
+    # --- Fast path: rule-based parser ---
+    local_items, confidence = parse_local_transaction(text)
+    if confidence == Confidence.HIGH and local_items:
+        logger.info("Local parse (HIGH confidence). Found %d item(s). Skipping Gemini.", len(local_items))
+        return {"items": local_items}
 
-    if has_suffix and not has_bare:
-        local_items = _parse_local_multiple(text)
-        if local_items:
-            logger.info("Local parse (multiple) success. Found %d items.", len(local_items))
-            return {"items": local_items}
+    logger.info("Local parse confidence=%s items=%d. Escalating to Gemini.", confidence, len(local_items))
 
-    # 2) Gemini parse for ambiguous / complex inputs
+    # --- Slow path: Gemini ---
     try:
         contents = [
             {"role": "user", "parts": [SYSTEM_PROMPT]},
@@ -515,7 +250,7 @@ def parse_expense(text: str) -> dict | None:
         raw_json = _extract_json(raw)
         data = json.loads(raw_json)
         items_raw = data.get("items", [])
-        
+
         if not items_raw and "amount" in data and "category" in data:
             items_raw = [data]
 
@@ -529,7 +264,7 @@ def parse_expense(text: str) -> dict | None:
                     tx_date = date.fromisoformat(str(itItem["date"]))
                 except ValueError:
                     pass
-            
+
             gemini_type = str(itItem.get("type", "")).lower()
             tx_type = gemini_type if gemini_type in ("expense", "income") else _guess_type(text)
             itItem["type"] = tx_type
@@ -548,7 +283,7 @@ def parse_expense(text: str) -> dict | None:
 
         if not parsed_items:
             logger.warning("Gemini returned no valid items, falling back to local.")
-            fallback = _parse_local_multiple(text)
+            fallback = local_items or _parse_local_multiple(text)
             return {"items": fallback} if fallback else None
 
         return {"items": parsed_items}
@@ -556,12 +291,14 @@ def parse_expense(text: str) -> dict | None:
     except Exception as e:
         if _is_quota_error(e):
             retry_after = _extract_retry_after_seconds(str(e))
-            logger.warning("Gemini quota/rate limit exceeded (text). retry_after=%s error=%s", retry_after, e)
+            logger.warning(
+                "Gemini quota/rate limit exceeded (text). retry_after=%s error=%s", retry_after, e
+            )
             raise GeminiQuotaExceeded("Gemini quota/rate limit exceeded", retry_after_seconds=retry_after)
 
         logger.error("Gemini parse failed: %s", e, exc_info=True)
-        # Last resort: local parse even without suffix
-        fallback = _parse_local_multiple(text)
+        # Last resort: reuse whatever local parse already found
+        fallback = local_items or _parse_local_multiple(text)
         return {"items": fallback} if fallback else None
 
 
