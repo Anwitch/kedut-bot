@@ -116,7 +116,7 @@ Kembalikan HANYA JSON (tanpa teks tambahan) dengan format:
         {
             "name": "<nama item>",
             "amount": <harga item sebagai float maksimal 11 digit>,
-            "category": "<salah satu: Makan, Transport, Belanja, Kesehatan, Hiburan, Tagihan, Pendidikan, Olahraga, Rumah, Lainnya>"
+            "category": "<salah satu: Makan & Minum, Transport, Belanja, Kesehatan, Hiburan, Tagihan, Pendidikan, Olahraga, Rumah, Lainnya>"
         }
     ],
     "date": "<YYYY-MM-DD atau null>"
@@ -188,6 +188,42 @@ def _is_transaction_input(text: str) -> bool:
 _is_expense_input = _is_transaction_input
 
 
+# Alias map: normalizes known AI variations → canonical category name.
+# Applied BEFORE VALID_CATEGORIES check so nothing falls through to "Lainnya"
+# just because the AI returned a shorter/variant label.
+_CATEGORY_ALIASES: dict[str, str] = {
+    "makan": "Makan & Minum",
+    "makan & minum": "Makan & Minum",
+    "makanan": "Makan & Minum",
+    "makanan & minuman": "Makan & Minum",
+    "food": "Makan & Minum",
+    "food & beverage": "Makan & Minum",
+    "f&b": "Makan & Minum",
+    "minuman": "Makan & Minum",
+    "transportasi": "Transport",
+    "transport": "Transport",
+    "shopping": "Belanja",
+    "health": "Kesehatan",
+    "entertainment": "Hiburan",
+    "bills": "Tagihan",
+    "education": "Pendidikan",
+    "sports": "Olahraga",
+    "home": "Rumah",
+    "salary": "Gaji",
+    "investment": "Investasi",
+    "other": "Lainnya",
+    "others": "Lainnya",
+}
+
+
+def _normalize_category(raw: str) -> str:
+    """Map raw category string (from AI) to canonical VALID_CATEGORIES name."""
+    stripped = raw.strip()
+    if stripped in VALID_CATEGORIES:
+        return stripped
+    return _CATEGORY_ALIASES.get(stripped.lower(), "Lainnya")
+
+
 def _sanitize_item(item: dict) -> dict:
     """Mutates and returns sanitized item. Raises ValueError if invalid."""
     MAX_AMOUNT = 99_999_999_999
@@ -197,8 +233,7 @@ def _sanitize_item(item: dict) -> dict:
     if not (0 < amount <= MAX_AMOUNT):
         raise ValueError("invalid amount")
     item["amount"] = amount
-    if item.get("category") not in VALID_CATEGORIES:
-        item["category"] = "Lainnya"
+    item["category"] = _normalize_category(str(item.get("category", "")))
     item["note"] = str(item.get("note", ""))[:200].strip() or "Transaksi"
     return item
 
@@ -369,7 +404,7 @@ def parse_expense_from_receipt_image(
                 continue
             amount = _coerce_amount(item.get("amount", 0))
             name = str(item.get("name", "")).strip() or "Item"
-            category = str(item.get("category", "Lainnya"))
+            category = _normalize_category(str(item.get("category", "Lainnya")))
 
             # Flag ambiguous items with '?' so user knows to review
             if amount <= 0:

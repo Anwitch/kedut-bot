@@ -42,21 +42,57 @@ def _resolve_profile_id(telegram_id: str) -> str:
     
     return new_prof.data[0]["id"]
 
+# Alias map as last-resort defence: if a shortened/variant name bypasses
+# the parser layer it still maps to the correct canonical category before
+# hitting the database, instead of silently falling back to "Lainnya".
+_CATEGORY_ALIASES: dict[str, str] = {
+    "makan": "Makan & Minum",
+    "makan & minum": "Makan & Minum",
+    "makanan": "Makan & Minum",
+    "food": "Makan & Minum",
+    "f&b": "Makan & Minum",
+    "transportasi": "Transport",
+    "shopping": "Belanja",
+    "health": "Kesehatan",
+    "entertainment": "Hiburan",
+    "bills": "Tagihan",
+    "education": "Pendidikan",
+    "sports": "Olahraga",
+    "home": "Rumah",
+    "salary": "Gaji",
+    "investment": "Investasi",
+    "other": "Lainnya",
+    "others": "Lainnya",
+}
+
+
 def _resolve_category_id(category_name: str) -> Optional[str]:
-    """Look up category id by name (case-insensitive). Falls back to 'Lainnya'."""
+    """Look up category id by name (case-insensitive). Falls back to 'Lainnya'.
+
+    Resolution order:
+      1. Exact match against DB cache.
+      2. Case-insensitive match.
+      3. Alias lookup (handles AI variations like "Makan" → "Makan & Minum").
+      4. Final fallback to "Lainnya".
+    """
     cache = _get_category_cache()
 
-    # Exact match first
+    # 1. Exact match
     if category_name in cache:
         return cache[category_name]
 
-    # Case-insensitive fallback
-    lower = category_name.lower()
+    # 2. Case-insensitive match
+    lower = category_name.strip().lower()
     for name, cid in cache.items():
         if name.lower() == lower:
             return cid
 
-    # Final fallback: Lainnya
+    # 3. Alias normalization
+    canonical = _CATEGORY_ALIASES.get(lower)
+    if canonical and canonical in cache:
+        return cache[canonical]
+
+    # 4. Final fallback: Lainnya
     return cache.get("Lainnya")
 
 def add_expense(
