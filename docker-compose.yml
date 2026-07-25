@@ -1,0 +1,19 @@
+# Bot Telegram Kedut — repo terpisah (Anwitch/kedut-bot), di-deploy sebagai
+# project dir sendiri di VPS Palugada.
+#
+# Worker murni: tidak membuka port, jadi tidak perlu entri di Caddy.
+# Berkas .env dibuat manual di VPS dan tidak pernah masuk git.
+
+services:
+  bot:
+    build:
+      context: .
+    container_name: kedut-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
